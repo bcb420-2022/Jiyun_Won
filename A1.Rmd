@@ -1,0 +1,245 @@
+---
+title: "Assignment 1"
+author: "Jiyun Won"
+date: "2/22/2022"
+output: html_document
+---
+
+## Download required Packages
+
+```{r}
+if (! requireNamespace("biocManager", quietly = TRUE)){
+  install.packages("BiocManager", repos = "http://cran.us.r-project.org")
+}
+if (! requireNamespace("GEOmetadb", quietly = TRUE)){
+  BiocManager::install("GEOmetadb")
+  }
+if (! requireNamespace("GEOquery", quietly = TRUE)){
+  BiocManager::install("GEOquery")
+}
+if (! requireNamespace("edgeR", quietly = TRUE)){
+  BiocManager::install("edgeR")
+}
+if (! requireNamespace("biomaRt", quietly = TRUE)){
+  BiocManager::install("biomaRt")
+}
+
+```
+
+Libraries
+```{r}
+library(BiocManager)
+library(GEOmetadb)
+library(GEOquery)
+library(edgeR)
+library(biomaRt)
+```
+
+## Download dataset : GEOmetadb
+To access the required gene dataset, download the GEOmeta file. 
+```{r}
+if (!file.exists("GSE84054_Rawcount_12patientER.txt.gz")){
+  GSE84054 <- GEOquery::getGEOSuppFiles('GSE84054')
+}
+fnames = rownames(GSE84054)
+```
+
+extract rawcount data as a data frame from fnames 
+
+```{r}
+exp <- read.delim(fnames[2], header=TRUE, check.names = FALSE)
+dim(exp)
+head(exp)
+```
+
+### Cleaning the data
+According to the GSE84054 NCBI page, the first 12 samples provided are patients with primary tumour and the last 12 samples are patients with Sphere breast cancer. 
+Create a data frame that indicates the sample type (Primary or Sphere). 
+```{r}
+dt_type <- data.frame("Type"=1:24)
+for (type1 in 1:12){
+  dt_type$Type[type1] = "Primary Tumour"
+}
+for (type2 in 13:24){
+  dt_type$Type[type2] = "Sphere"
+}
+rownames(dt_type) <- colnames(exp)[2:25]
+
+head(dt_type) # Primary Tumour
+tail(dt_type) # Sphere
+```
+
+Use edgeR package to filter unnecessary data  that does not have meaningful contribution to the research.
+
+```{r}
+# filter data
+cpms = edgeR::cpm(exp[, 2:25])
+keep = rowSums(cpms > 1) >= 3 # Dataset of 3 samples per group 
+filtered_exp <- exp[keep,]
+# check filtered data
+head(filtered_exp)
+dim(filtered_exp) # 19873
+
+```
+
+### Mapping gene (assign to proper HUGO symbol)
+
+The dataset consist of ensemblID to represent the genes so we map these IDs to HUGO gene symbols. 
+```{r}
+mart <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+map_exp <- biomaRt::getBM(filters = "ensembl_gene_id", attributes = c("hgnc_symbol", "ensembl_gene_id"), values = filtered_exp[1], mart = mart)
+head(map_exp) # new mapped dataset top 6 rows 
+nrow(map_exp) # 19145 : some IDs not found or more than one ids mapped to same gene
+```
+96% of the genes are mapped to proper HUGO gene symbols so the remaining missing IDs will not be an issue here. No update required. 
+
+### Clean new mapped dataset 
+Check if no empty values
+```{r}
+map_exp <- map_exp[!(map_exp %in% c(""))]
+```
+
+Check for duplicates
+```{r}
+sum(duplicated(map_exp$ensembl_gene_id))
+sum(! (filtered_exp[1]) %in% map_exp$ensembl_gene_id)
+dup <- map_exp$ensembl_gene_id[duplicated(map_exp$ensembl_gene_id)]
+map_exp[map_exp$ensembl_gene_id %in% dup, ]
+```
+The two HUGO symbols indicated as duplicates are the same gene according to the ensembl gene portal so no change is required. 
+
+```{r}
+copy_filter <- filtered_exp
+copy_filter <- merge(map_exp, copy_filter, by.x = 2, by.y = 1, all.y = TRUE)
+head(copy_filter)
+length(copy_filter$ensembl_gene_id[which(is.na(copy_filter$hgnc_symbol))]) # no duplicates
+
+```
+save mapped dataset into new dataset filtered2exp 
+```{r}
+filtered2exp <- map_exp$hgnc_symbol
+names(filtered2exp) <- map_exp$ensembl_gene_id
+head(filtered2exp)
+```
+
+
+### Normalization 
+Before normalization, examine different visualizations of dataset distribution. 
+
+Box Plot (before): Similar means
+```{r}
+data2plot <- log2(edgeR::cpm(copy_filter[, 3:26]))
+boxplot(data2plot, xlab = "Samples", ylab = "log2 CPM", las = 2, cex = 0.5, 
+        cex.lab = 0.5, cex.axis = 0.5, main = "RNASeq Samples: GSE84054")
+abline(h = median(apply(data2plot, 2, median)), col = "red", lwd = 0.6, lty = "dashed")
+```
+
+Density Plot (before): higher peak on the left side 
+```{r}
+counts_density <- apply(log2(edgeR::cpm(copy_filter[,3:26])), 2, density)
+                             xlim <- 0
+                             ylim <- 0
+                             for (i in 1:length(counts_density)){
+                               xlim <- range(c(xlim, counts_density[[i]]$x));
+                               ylim <- range(c(ylim, counts_density[[i]]$y))
+                             } 
+                             cols <- rainbow(length(counts_density))
+                             ltys <- rep(1, length(counts_density))
+                             plot(counts_density[[i]], xlim = xlim, 
+                                  ylim = ylim, type = "n", 
+                                  ylab = "Smoothing density of log2-CPM", main = "", cex.lab = 0.8)
+                             for(i in 1:length(counts_density)){
+                               lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+                             }
+                             legend("topright", colnames(data2plot), col=cols, lty=ltys, 
+                                    cex=0.75, border="blue", text.col = "green4", 
+                                    merge = TRUE, bg = "gray90")
+```
+
+Normalization on filtered_exp data 
+Use TMM normalization for RNA seq data : effective in estimating RNA production levels from RNA-seq data. 
+```{r}
+mat <- as.matrix(copy_filter[,3:26])
+rownames(mat) <- copy_filter$ensembl_gene_id
+d <- edgeR::DGEList(counts = mat, group = dt_type$Type)
+d <- edgeR::calcNormFactors(d)
+normalized_counts <- edgeR::cpm(d)
+rownames(normalized_counts) <- copy_filter$hgnc_symbol
+nrow(normalized_counts)
+head(normalized_counts)
+```
+
+Now, do the exact investigation by plotting boxplot and density graph after normalization. 
+
+Boxplot (after): Median line lies very close to all samples' median value
+```{r}
+data2plot <- log2(normalized_counts)
+boxplot(data2plot, xlab = "Samples", ylab = "log2 CPM", las = 2, cex = 0.5, 
+        cex.lab = 0.5, cex.axis = 0.5, main = "RNASeq Samples (after normalization): GSE84054")
+abline(h = median(apply(data2plot, 2, median)), col = "red", lwd = 0.6, lty = "dashed")
+```
+
+Density Plot (after): No big change
+```{r}
+counts_density <- apply(log2(normalized_counts), 2, density)
+                             xlim <- 0
+                             ylim <- 0
+                             for (i in 1:length(counts_density)){
+                               xlim <- range(c(xlim, counts_density[[i]]$x));
+                               ylim <- range(c(ylim, counts_density[[i]]$y))
+                             } 
+                             cols <- rainbow(length(counts_density))
+                             ltys <- rep(1, length(counts_density))
+                             plot(counts_density[[i]], xlim = xlim, 
+                                  ylim = ylim, type = "n", 
+                                  ylab = "Smoothing density of log2-CPM", main = "Density plot (after normalization)", cex.lab = 0.8)
+                             for(i in 1:length(counts_density)){
+                               lines(counts_density[[i]], col=cols[i], lty=ltys[i])
+                             }
+                             legend("topright", colnames(data2plot), col=cols, lty=ltys, 
+                                    cex=0.75, border="blue", text.col = "green4", 
+                                    merge = TRUE, bg = "gray90")
+```
+
+MDS Plot (after): 
+```{r}
+plotMDS(d, labels = rownames(dt_type), col = c("green","blue", "red")[factor(dt_type$Type)])
+```
+# Final Coverage 
+```{r}
+nrow(normalized_counts) / nrow(exp)
+```
+# Final dataset
+Normalization and cleaning of the dataset complete.
+```{r}
+final_data <- as.data.frame(normalized_counts)
+head(final_data)
+```
+
+# Interpret and Document 
+### What are the control and test conditions of the dataset? 
+The control condition was the primary tumour samples. 
+The test condition consists of the sphere tumours. 
+
+### Why is the dataset of interest to you?
+The dataset was interesting as I am interested in investigating cancer diagnostic research and this research suggested possible diagnostic biomarker that can contribute in detecting breast cancer. 
+
+### Were there expression values that were not unique for specific genes? How did you handle these? 
+There were duplicate genes but the numbers were small enough to not exclude them since it did not hve significant impact on the data process. 
+
+### Were there expression values that could not be mapped to current HUGO symbols? 
+Yes, but the total mapped symbols were more than 96% of the orginal dataset so it was disregarded. 
+
+### How many outliers were removed? 
+According to the boxplot there were 24 outliers detected and were not included in the boxplot image. 
+and the only manually removed outliers were the ones with low counts. 
+
+### How did you handle replicates? 
+The ncbi GEO page indicated that 12 out of 24 replicates were primary tumour and other 12 were sphere, so I handled them by sorting them into two groups.
+
+### What is the final coverage of your dataset? 
+The final coverage of the data set is 34.70% 
+
+# References 
+Isserlin, Ruth. (2022, February 13). BCB420: Lecture 4:Exploring the data and basics of Normalization.
+Isserlin, Ruth. (2022, February 15). BCB420: Lecture 5:Data exploration and Identifier mapping.

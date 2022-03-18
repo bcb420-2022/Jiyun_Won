@@ -1,0 +1,332 @@
+---
+title: "Assignment 1"
+author: "Jiyun Won"
+date: "3/14/2022"
+output: html_document
+---
+
+
+### Download required Packages
+
+```{r}
+
+if (! requireNamespace("biocManager", quietly = TRUE)){
+  install.packages("BiocManager", repos = "http://cran.us.r-project.org")
+}
+if (! requireNamespace("ComplexHeatmap", quietly = TRUE))
+  BiocManager::install("ComplexHeatmap")
+if (! requireNamespace("gprofiler2", quietly = TRUE))
+  BiocManager::install("gprofiler2")
+if (!requireNamespace("knitr", quietly = TRUE))
+  BiocManager::install("knitr")
+if (!requireNamespace("edgeR", quietly = TRUE))
+  BiocManager::install("edgeR")
+if (!requireNamespace("circlize", quietly = TRUE))
+  BiocManager::install("circlize")
+
+```
+
+### library 
+```{r}
+library(BiocManager)
+library(ComplexHeatmap)
+library(gprofiler2)
+library(knitr)
+library(edgeR)
+library(circlize)
+
+```
+
+
+### Load dataset 
+
+```{r}
+
+nor_count <- read.table(file ="GSE84054_RLDNormalizedCount_12patientER.txt.gz", header = TRUE)
+head(nor_count)
+
+```
+
+### Differential Expression Analysis 
+## Model Design 
+Define your model design to be used to calculate differential expression - revisit your MDS plot from Assignment #1 to demonstrate your choice of factors in your model.
+```{R}
+type_map <- nor_count[,3:ncol(nor_count)]
+rownames(type_map) <- nor_count$EnsemblGeneID
+colnames(type_map) <- rownames(dt_type)
+
+plotMDS(type_map, labels = rownames(dt_type), 
+        col = c("red", "blue")[factor(dt_type$Type)], 
+        main = "MDS Plot - cell type")
+```
+
+
+```{r}
+modelDesign <- model.matrix(~ dt_type$Type)
+head(modelDesign)
+```
+## Calculate p-values for each of the genes 
+Calculate p-values for each of the genes in your expression set. 
+How many genes were significantly deferentially expressed? 
+What thresholds did you use and why?
+
+```{r}
+expressionMatrix <- as.matrix(nor_count[, 3:ncol(nor_count)])
+rownames(expressionMatrix) <- nor_count$EnsemblGeneID
+colnames(expressionMatrix) <- colnames(nor_count)[3:ncol(nor_count)]
+minimalSet <- ExpressionSet(assayData = expressionMatrix)
+```
+
+```{r}
+fit <- lmFit(minimalSet, modelDesign)
+#Apply empirical Bayes to compute differential expression
+fit2 <- eBayes(fit, trend = TRUE) # trend=TRUE specific to RNA-seq data
+```
+
+```{r}
+topfit <- topTable(fit2, coef = ncol(modelDesign), 
+                   adjust.method = "BH", 
+                   number = nrow(expressionMatrix))
+# merge hgnc names to topfit table 
+output_hits <- merge(nor_count[,1:2], topfit, by.y = 0, by.x = 1, all.y = TRUE)
+
+# sort by p-value 
+output_hits <- output_hits[order(output_hits$P.Value), ]
+head(output_hits)
+```
+## How many gene pass the threshold p-value<0.05
+```{r}
+length(which(output_hits$P.Value < 0.05)) #10071
+```
+## How many genes pass correction 
+```{r}
+length(which(output_hits$adj.P.Val < 0.05)) #8016
+```
+
+## Differential expression calculation (edgeR) 
+EdgeR uses negative binomial distribution to model gene counts. 
+```{r}
+# Set up edgeR objects 
+d = DGEList(counts = mat, group = dt_type$Type)
+# estimate Dispersion 
+d <- estimateDisp(d, modelDesign)
+```
+
+## Estimate Dispersion (plot BCV) 
+```{r}
+# red dots : each gene 
+# blue line : trend
+plotBCV(d, col.common = "black", col.tagwise = "red")
+```
+
+```{r}
+# binomial distribution 
+plotMeanVar(d, show.raw.vars = TRUE, 
+            show.tagwise.vars = TRUE, 
+            show.ave.raw.vars = TRUE, 
+            NBline = TRUE, 
+            show.binned.common.disp.vars = TRUE, 
+            main = "Distribution")
+```
+
+## Calculate differential expression using Quasi liklihood model. 
+Quasi liklihood : used for complicated models and highly recommended for bulk RNASeq experiments. 
+```{r}
+fit <- edgeR::glmQLFit(d, modelDesign)
+qlf.pos_vs_neg <- edgeR::glmQLFTest(fit, coef = 'dt_type$TypeSphere')
+head(qlf.pos_vs_neg)
+
+#get all the results 
+qlf_output_hits <- topTags(qlf.pos_vs_neg, sort.by = "PValue", n = nrow(nor_count))
+```
+## How many gene pass the threshold p-value<0.05
+```{r}
+length(which(qlf_output_hits$table$PValue < 0.05)) #7360
+```
+## How many genes pass correction 
+```{r}
+length(which(qlf_output_hits$table$FDR < 0.05)) #4846
+```
+
+## How many genes are up regulated 
+```{r}
+length(which(qlf_output_hits$table$PValue < 0.05 & qlf_output_hits$table$logFC > 0))
+# 1886
+```
+
+## How many genes are down regulated
+```{r}
+length(which(qlf_output_hits$table$PValue < 0.05 & qlf_output_hits$table$logFC < 0 ))
+# 5474
+```
+
+## Create thresholded lists of genes. 
+```{r}
+# merge gene names with the top hits 
+qlf_output_hits_withgn <- merge(filtered_exp[,1:2], qlf_output_hits, by.x = 1, by.y = 0)
+# up-regulated genes 
+upregulated_genes <- qlf_output_hits_withgn$Var.1[which(qlf_output_hits$table$PValue < 0.05 & qlf_output_hits$table$logFC < 0)]
+# down-regulated genes 
+downregulated_genes <- qlf_output_hits_withgn$Var.1[which(qlf_output_hits$table$PValue < 0.05 & qlf_output_hits$table$logFC > 0)]
+
+# store up-regulated 
+write.table(x=upregulated_genes, file = file.path("upreg_genes.txt"), sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+# store down-regulated 
+write.table(x=downregulated_genes, file = file.path("downreg_genes.txt"), sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+# store all
+up <- data.frame(upregulated_genes)
+down <- data.frame(downregulated_genes)
+names(up) <- names(down)
+allGenes <- rbind(up, down)
+colnames(allGenes) <- "allGenes"
+write.table(x=allGenes, file = file.path("all_genes.txt"), sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+```
+
+
+## Amount of differentially expressed genes using volcano plot 
+```{r}
+data <- cbind(qlf_output_hits$table$logFC, -log10(qlf_output_hits$table$FDR))
+colnames(data) <- c("logFC", "PValue")
+
+up_volcano <- qlf_output_hits$table$FDR < 0.05 & qlf_output_hits$table$logFC > 0
+down_volcano <- qlf_output_hits$table$FDR < 0.05 & qlf_output_hits$table$logFC < 0
+
+```
+
+# Up-volcano plot 
+```{r}
+col <- ifelse(up_volcano, "red", "grey")
+plot(data, pch = 16, col = col, cex = 0.5, main = "Up-regulated genes")
+```
+
+# Down-volcano plot 
+```{r}
+col <- ifelse(down_volcano, "Blue", "grey")
+plot(data, pch = 16, col = col, cex = 0.5, main = "Down-regulated genes")
+```
+# Visualize top hits using a heatmap 
+```{r echo=FALSE,warning=FALSE,message=FALSE}
+# create a numerical matrix to create heatmap 
+condition <- output_hits$P.Value<0.05
+heatmap_matrix_row <- rownames(qlf_output_hits$table)[condition]
+# calc transpose of a matrix
+# initialize matrix 
+heatmap_matrix <- t(scale(t(type_map[which(rownames(type_map) %in% heatmap_matrix_row),])))
+match1 <- grep(colnames(heatmap_matrix), pattern = "_P")
+match2 <- grep(colnames(heatmap_matrix), pattern = "_S")
+heatmap_matrix <- heatmap_matrix[, c(match1, match2)]
+
+if(min(heatmap_matrix) == 0){
+  map_color = circlize::colorRamp2(c(0, max(heatmap_matrix)), 
+                             c( "white", "red"))
+    } else {
+      map_color = circlize::colorRamp2(c(min(heatmap_matrix), 0, max(heatmap_matrix)), c("blue", "white", "red"))
+    }
+
+final_map <- ComplexHeatmap::Heatmap(as.matrix(heatmap_matrix),
+                                     show_row_dend = TRUE, 
+                                     show_column_dend = TRUE,
+                                     show_column_names = TRUE, 
+                                     show_row_names = FALSE,
+                                     col = map_color, 
+                                     show_heatmap_legend = TRUE,)
+                         
+final_map
+```
+### Thresholded over-representation analysis 
+1. Which method did you choose and why?
+
+G:Profiler is chosen for the analysis because the tool allow over-representation analysis to identify enriched biological pathways and functions. 
+
+2. What annotation data did you use and why? What version of the annotation are you using?
+
+GO:Biological process, KEGG, Reactome, and Wiki Pathways are used as annotation data and version 0.2.1 of the R package gprofiler2 is installed for usage. The g:Profiler website had final update on  2022-03-01. 
+```{r}
+g <- gprofiler2::gost(rownames(allGenes), organism = "hsapiens", 
+                             correction_method = c("fdr"),
+                             user_threshold = 0.05,
+                             sources = c("GO:BP", "KEGG", "REAC", "WP"))
+```
+
+How many gene sets were returned with what thresholds?
+
+Threshold for all: 0.05
+
+For All Genes (7554):
+  GO:BP : 5997 
+  KEGG : 239 
+  REAC : 939 
+  WP : 379
+```{r}
+nrow(g$result)
+table(g$result$source)
+#7554
+```
+
+For Up-regulated Genes (2661):
+  GO:BP : 2350          
+  KEGG : 37 
+  REAC : 239 
+  WP : 35 
+```{r}
+g_up <- gprofiler2::gost(upregulated_genes, organism = "hsapiens", 
+                             correction_method = c("fdr"),
+                             user_threshold = 0.05,
+                             sources = c("GO:BP", "KEGG", "REAC", "WP"))
+nrow(g_up$result)
+table(g_up$result$source)
+# 2661
+```
+For Down-regulated Genes (890):
+  GO:BP : 886          
+  KEGG : 4 
+
+```{r}
+g_down <- gprofiler2::gost(downregulated_genes, organism = "hsapiens", 
+                             correction_method = c("fdr"),
+                             user_threshold = 0.05,
+                             sources = c("GO:BP", "KEGG", "REAC", "WP"))
+nrow(g_down$result)
+table(g_down$result$source)
+# 890
+```
+Run the analysis using the up-regulated set of genes, and the down-regulated set of genes separately. How do these results compare to using the whole list (i.e all differentially expressed genes together vs. the up-regulated and down regulated differentially expressed genes separately)?
+
+For all genes, the most enriched term names are multicellular organismal process and response to organic substance. 
+```{r}
+knitr::kable(g$result$term_name[1:5])
+```
+
+For Up-regulated genes, the most enriched term names are cellular macromolecule metabolic process and organonitrogen compound metabolic process. 
+```{r}
+knitr::kable(g_up$result$term_name[1:5])
+```
+
+For Down-regulated genes, the most enriched term names are organonitrogen compound metabolic process and positive regulation of cellular process. 
+```{r}
+knitr::kable(g_down$result$term_name[1:5])
+```
+
+### Interpretation 
+1. Do the over-representation results support conclusions or mechanism discussed in the original paper?
+
+According to the original paper the up-regulated gene with more than 2 fold change found were 1401 while I found 1293 which is not the same but similar.
+Result on down-regulated gene was not discussed in the original paper. 
+```{r}
+head(qlf_output_hits_withgn)
+up_gene_symbol <- qlf_output_hits_withgn$Var.1[which(qlf_output_hits$table$PValue < 0.05 & qlf_output_hits$table$logFC > 1)]
+
+length(up_gene_symbol) #1293
+```
+2. Can you find evidence, i.e. publications, to support some of the results that you see. How does this evidence support your results.
+According to the result the upregulated genes are mostly metabolic and cellular processes and the overall analysis can be supported by the original paper : https://pubmed.ncbi.nlm.nih.gov/28967919/
+
+
+### Reference
+n.a,. ComplexHeatmap. 2022. 
+https://www.bioconductor.org/packages/release/bioc/html/ComplexHeatmap.html
+
+Ramos M, Morgan M. BiocManager. 2021. https://cran.r-project.org/web/packages/BiocManager/index.html. 
+
